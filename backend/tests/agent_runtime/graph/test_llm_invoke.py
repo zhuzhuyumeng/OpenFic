@@ -116,6 +116,121 @@ class TestClassifyError:
         assert outcome.decision is RetryDecision.RETRY
         assert outcome.category is RetryCategory.TIMEOUT
 
+    def test_retries_openrouter_upstream_idle_timeout(self) -> None:
+        outcome = classify_error(
+            ValueError(
+                "OpenRouter API returned an error during streaming: "
+                "Upstream idle timeout exceeded (code: 504)"
+            )
+        )
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.HTTP
+
+    @pytest.mark.parametrize("code", [500, 502, 503, 504])
+    def test_retries_embedded_gateway_status_code(self, code: int) -> None:
+        outcome = classify_error(
+            ValueError(
+                "OpenRouter API returned an error during streaming: "
+                f"provider failed (code: {code})"
+            )
+        )
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.HTTP
+
+    def test_retries_openai_sdk_error_code(self) -> None:
+        outcome = classify_error(RuntimeError("Error code: 502 - bad gateway"))
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.HTTP
+
+    def test_retries_status_code_text(self) -> None:
+        outcome = classify_error(RuntimeError("status code: 503"))
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.HTTP
+
+    def test_retries_upstream_timeout_without_status_code(self) -> None:
+        outcome = classify_error(ValueError("upstream timeout while streaming"))
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.TIMEOUT
+
+    def test_retries_idle_timeout_without_status_code(self) -> None:
+        outcome = classify_error(ValueError("Upstream idle timeout exceeded"))
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.TIMEOUT
+
+    def test_retries_timed_out_text(self) -> None:
+        outcome = classify_error(RuntimeError("upstream server timed out"))
+        assert outcome.decision is RetryDecision.RETRY
+        assert outcome.category is RetryCategory.TIMEOUT
+
+    def test_no_retry_embedded_auth_code(self) -> None:
+        outcome = classify_error(
+            ValueError(
+                "OpenRouter API returned an error during streaming: "
+                "request rejected (code: 401)"
+            )
+        )
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.AUTH
+
+    def test_no_retry_embedded_auth_code_with_timeout_text(self) -> None:
+        outcome = classify_error(
+            ValueError(
+                "OpenRouter API returned an error during streaming: "
+                "request timeout (code: 401)"
+            )
+        )
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.AUTH
+
+    def test_no_retry_embedded_quota_code(self) -> None:
+        outcome = classify_error(
+            ValueError(
+                "OpenRouter API returned an error during streaming: "
+                "insufficient quota (code: 429)"
+            )
+        )
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.QUOTA
+
+    def test_no_retry_quota_text_that_mentions_timeout(self) -> None:
+        outcome = classify_error(
+            RuntimeError("you have exceeded your quota after idle timeout")
+        )
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.QUOTA
+
+    def test_no_retry_context_overflow_that_mentions_timeout(self) -> None:
+        outcome = classify_error(
+            RuntimeError("maximum context length exceeded; request timed out")
+        )
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.CONTEXT_OVERFLOW
+
+    def test_no_retry_auth_text_that_mentions_timeout(self) -> None:
+        outcome = classify_error(RuntimeError("authentication failed: request timeout"))
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.AUTH
+
+    def test_no_retry_unrelated_timeout_word(self) -> None:
+        outcome = classify_error(ValueError("invalid timeout parameter"))
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.OTHER
+
+    def test_no_retry_embedded_client_error(self) -> None:
+        outcome = classify_error(
+            ValueError(
+                "OpenRouter API returned an error during streaming: "
+                "bad request (code: 400)"
+            )
+        )
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.OTHER
+
+    def test_does_not_treat_longer_code_numbers_as_status(self) -> None:
+        outcome = classify_error(ValueError("reference (code: 5040)"))
+        assert outcome.decision is RetryDecision.NO_RETRY
+        assert outcome.category is RetryCategory.OTHER
+
     def test_retries_sdk_timeout_by_class_name(self) -> None:
         class APITimeoutError(Exception):
             pass
@@ -319,6 +434,52 @@ class TestInvokeModelWithRetry:
                 "retry_in_ms": 0,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_retries_openrouter_stream_idle_timeout(self) -> None:
+        calls = 0
+
+        async def invoke(*args: Any, **kwargs: Any) -> AIMessage:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError(
+                    "OpenRouter API returned an error during streaming: "
+                    "Upstream idle timeout exceeded (code: 504)"
+                )
+            return AIMessage(content="ok")
+
+        result = await invoke_model_with_retry(
+            object(),
+            [],
+            invoke=invoke,
+            settings=_ZERO_BACKOFF,
+        )
+
+        assert result.content == "ok"
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_openrouter_stream_auth_error(self) -> None:
+        calls = 0
+
+        async def invoke(*args: Any, **kwargs: Any) -> AIMessage:
+            nonlocal calls
+            calls += 1
+            raise ValueError(
+                "OpenRouter API returned an error during streaming: "
+                "request rejected (code: 401)"
+            )
+
+        with pytest.raises(ValueError, match="request rejected"):
+            await invoke_model_with_retry(
+                object(),
+                [],
+                invoke=invoke,
+                settings=_ZERO_BACKOFF,
+            )
+
+        assert calls == 1
 
     @pytest.mark.asyncio
     async def test_retry_exhausted_raises_final_error(self) -> None:

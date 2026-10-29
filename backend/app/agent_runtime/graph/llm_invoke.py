@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import ssl
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -108,6 +109,28 @@ _CONTEXT_PATTERNS = (
     "prompt is too long",
     "too many tokens",
 )
+# 流式网关把 HTTP 状态写进正文，而不是异常的 status_code。
+# LangChain OpenRouter: "... Upstream idle timeout exceeded (code: 504)"
+# OpenAI SDK: "Error code: 504"
+_EMBEDDED_STATUS_CODE_RE = re.compile(
+    r"(?:"
+    r"\(\s*code\s*:\s*"
+    r"|error\s+code\s*:\s*"
+    r"|status(?:\s+|_)code\s*[:=]\s*"
+    r")(\d{3})\b"
+)
+_TIMEOUT_MESSAGE_PATTERNS = (
+    "idle timeout",
+    "upstream timeout",
+    "gateway timeout",
+    "gateway time-out",
+    "read timeout",
+    "connect timeout",
+    "connection timeout",
+    "request timeout",
+    "timeout exceeded",
+    "timed out",
+)
 _TLS_CERTIFICATE_PATTERNS = (
     "certificate verify failed",
     "certificate_verify_failed",
@@ -191,6 +214,14 @@ def _error_status_code(exc: BaseException) -> int | None:
     return status_code if isinstance(status_code, int) else None
 
 
+def _embedded_status_code(message: str) -> int | None:
+    """从无 status_code 的网关/SDK 错误正文中提取 HTTP 状态码。"""
+    match = _EMBEDDED_STATUS_CODE_RE.search(message)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def _error_headers(exc: BaseException) -> dict[str, str]:
     raw_headers: Any = None
     response = getattr(exc, "response", None)
@@ -206,7 +237,7 @@ def _error_headers(exc: BaseException) -> dict[str, str]:
 def classify_error(exc: BaseException) -> RetryOutcome:
     """按错误类型决定是否重试及所属分类。
 
-    可重试：5xx、限流、超时、网络类、空响应。
+    可重试：5xx（含流式错误正文中的 code）、限流、超时、网络类、空响应。
     不可重试：认证、配额、上下文溢出、压缩失败、用户中断及未分类错误。
     """
     if isinstance(exc, EmptyResponseError):
@@ -221,6 +252,8 @@ def classify_error(exc: BaseException) -> RetryOutcome:
     status_code = _error_status_code(exc)
     message = str(exc).lower()
     exc_name = type(exc).__name__.lower()
+    if status_code is None:
+        status_code = _embedded_status_code(message)
     if status_code is not None:
         if 500 <= status_code < 600:
             return RetryOutcome(RetryDecision.RETRY, RetryCategory.HTTP)
@@ -242,7 +275,11 @@ def classify_error(exc: BaseException) -> RetryOutcome:
     if _contains_any(message, _CONTEXT_PATTERNS):
         return RetryOutcome(RetryDecision.NO_RETRY, RetryCategory.CONTEXT_OVERFLOW)
 
-    if isinstance(exc, TimeoutError) or "timeout" in exc_name:
+    if (
+        isinstance(exc, TimeoutError)
+        or "timeout" in exc_name
+        or _contains_any(message, _TIMEOUT_MESSAGE_PATTERNS)
+    ):
         return RetryOutcome(RetryDecision.RETRY, RetryCategory.TIMEOUT)
     if isinstance(exc, ConnectionError) or "connection" in exc_name:
         return RetryOutcome(RetryDecision.RETRY, RetryCategory.NETWORK)
